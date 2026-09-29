@@ -9,9 +9,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,51 +28,80 @@ jobs:
 
   lint-chart:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Set up Helm
-        uses: azure/setup-helm@v4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
 
       - name: Helm lint
         run: helm lint chart
 
   build:
-    needs:
-      - test
-      - lint-chart
+    needs: [test, lint-chart]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     permissions:
       contents: read
       packages: write
 
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      tag: ${{ steps.vars.outputs.tag }}
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set image name
-        id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - id: vars
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Set image tag
-        id: tag
-        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Docker image
-        run: |
-          docker build \
-            -t ${{ steps.image.outputs.name }}:${{ steps.tag.outputs.tag }} .
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}
 
-      - name: Push Docker image
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: lab
+
+      - name: Deploy with Helm
         run: |
-          docker push \
-            ${{ steps.image.outputs.name }}:${{ steps.tag.outputs.tag }}
+          helm upgrade --install demo chart \
+            --set image.repository=${{ needs.build.outputs.image }} \
+            --set image.tag=${{ needs.build.outputs.tag }} \
+            --atomic \
+            --wait \
+            --timeout 120s
+
+      - name: Smoke test
+        run: |
+          kubectl rollout status deployment/demo --timeout=60s
+          kubectl port-forward svc/demo 8080:80 &
+          sleep 5
+          curl -fsS localhost:8080/healthz
+          curl -fsS localhost:8080/ | grep "${{ needs.build.outputs.tag }}"
+
+      - name: Show release
+        if: always()
+        run: |
+          helm list
+          kubectl get pods -o wide
